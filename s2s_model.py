@@ -157,7 +157,8 @@ class slam_model_s2s(slam_model):
         self.group_decode_adapter = group_decode_adapter
 
 
-    def forward(self,
+    @torch.no_grad()
+    def get_emb(self,
                 input_ids: torch.LongTensor = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.LongTensor] = None,
@@ -237,16 +238,177 @@ class slam_model_s2s(slam_model):
         
         inputs_embeds = torch.mean(inputs_embeds, dim=1)  # [btz, seq_length, emb_dim], average over the code layers
 
+        return inputs_embeds, attention_mask
+
+
+    @staticmethod
+    def get_masked_indices_from_embeds(noisy_embeds, masked_embed):
+        # Get shape information
+        b, l, d = noisy_embeds.shape
+        # Expand masked_embed to the same shape as noisy_embeds [b, l, d]
+        masked_embed_expanded = masked_embed.expand(b, l, d)
+        # Calculate absolute difference
+        abs_diff = torch.abs(noisy_embeds - masked_embed_expanded)
+        # Calculate tolerance boundary (atol + rtol * abs(masked_embed))
+        tolerance = 1e-5 + 1e-5 * torch.abs(masked_embed_expanded)
+        # Check if all dimensions at each position are within tolerance
+        # all(dim=-1) ensures all dimensions of each embedding meet the condition
+        masked_indices = (abs_diff <= tolerance).all(dim=-1)
+        
+        return masked_indices
+
+
+
+
+    def forward(self,
+                input_ids: torch.LongTensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_values: Optional[List[torch.FloatTensor]] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                labels: Optional[torch.LongTensor] = None,
+                use_cache: Optional[bool] = None,
+                output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None,
+                return_dict: Optional[bool] = None,
+                **kwargs,
+                ):
+
+
+        # 获取embedding
+
+        audio_mel = kwargs.get("audio_mel", None)
+        audio_embedding = kwargs.get("audio_embedding", None)
+        audio_mel_post_mask = kwargs.get("audio_mel_post_mask", None) # 2x downsample for whisper
+
+        audio = kwargs.get("audio", None)
+        audio_mask = kwargs.get("audio_mask", None)
+
+        modality_mask = kwargs.get("modality_mask", None)
+
+
+        pad_t = self.model_config.vocab_config.pad_t
+        pad_a = self.model_config.vocab_config.pad_a
+
+        encoder_outs = None
+        if audio_mel is not None or audio is not None:
+            if audio_embedding is None:
+                if self.train_config.freeze_encoder: # freeze encoder
+                    self.encoder.eval()
+
+                if self.model_config.encoder_name == "whisper":
+                    encoder_outs = self.encoder.extract_variable_length_features(audio_mel.permute(0, 2, 1)) # bs*seq*dim
+                if self.model_config.encoder_name == "wavlm":
+                    encoder_outs = self.encoder.extract_features(audio, 1 - audio_mask) #(FIX:MZY): 1-audio_mask is needed for wavlm as the padding mask
+                if self.model_config.encoder_name == "hubert":
+                    results = self.encoder(source = audio, padding_mask = 1-audio_mask)
+                    if self.model_config.encoder_type == "pretrain":
+                        encoder_outs, audio_mel_post_mask = results["x"], results["padding_mask"]
+                    if self.model_config.encoder_type == "finetune":
+                        encoder_outs, audio_mel_post_mask = results["encoder_out"], results["padding_mask"]
+                        encoder_outs = encoder_outs.transpose(0, 1)
+                if self.encoder is None:
+                    encoder_outs = audio_mel if audio_mel is not None else audio
+            else:
+                encoder_outs = audio_embedding
+
+            if self.model_config.encoder_projector == "q-former":
+                encoder_outs = self.encoder_projector(encoder_outs, audio_mel_post_mask)
+            if self.model_config.encoder_projector == "linear":
+                encoder_outs = self.encoder_projector(encoder_outs)
+            if self.model_config.encoder_projector == "cov1d-linear": 
+                encoder_outs = self.encoder_projector(encoder_outs)
+
+        if input_ids is not None:
+            input_ids[input_ids == -1] = 0  # [btz, code_layer + 1, seq_length]
+
+            if isinstance(self.llm, T5ForConditionalGeneration):
+                inputs_embeds = self.llm.shared(input_ids)
+            else:
+                if hasattr(self.llm.model, "embed_tokens"):
+                    inputs_embeds = self.llm.model.embed_tokens(input_ids)  # [btz, code_layer + 1, seq_length, emb_dim]
+                elif hasattr(self.llm.model.model, "embed_tokens"):
+                    inputs_embeds = self.llm.model.model.embed_tokens(input_ids)
+                else:
+                    inputs_embeds = self.llm.model.model.model.embed_tokens(input_ids)
+
+        if modality_mask is not None and encoder_outs is not None:
+            modality_mask = modality_mask.unsqueeze(1).repeat(1, self.code_layer, 1)  # [btz, code_layer, seq_length]
+            modality_mask_start_indices = (modality_mask == True).float().argmax(dim=2)
+            modality_lengths = torch.clamp(modality_mask.sum(dim=2), max=encoder_outs.shape[1]).tolist()
+
+            encoder_outs_pad = torch.zeros_like(inputs_embeds)
+            for i in range(encoder_outs.shape[0]):
+                for j in range(self.code_layer):
+                    start_idx = modality_mask_start_indices[i, j].item()
+                    length = modality_lengths[i][j]
+                    encoder_outs_pad[i, j, start_idx:start_idx+length] = encoder_outs[i, :length]
+            
+            inputs_embeds[:, :self.code_layer, :, :] = encoder_outs_pad[:, :self.code_layer, :, :] + inputs_embeds[:, :self.code_layer, :, :] * (~modality_mask[:, :, :, None])
+        
+        inputs_embeds = torch.mean(inputs_embeds, dim=1)  # [btz, seq_length, emb_dim], average over the code layers
+
+        # print('inputs_embeds',inputs_embeds.shape)
+
         if kwargs.get("inference_mode", False):
             return inputs_embeds, attention_mask
 
+        
         text_labels = labels[:,self.code_layer] if labels is not None else None
         audio_labels = labels[:, :self.code_layer] if labels is not None else None
-        model_outputs = self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=text_labels)    # here we use the text token layer as the target label
+
+
+        def forward_process_embeds(input_embeds, labels, eps=1e-3):
+            b, l, d = input_embeds.shape
+            t = torch.rand(b, device=input_embeds.device)
+            p_mask = (1 - eps) * t + eps
+            p_mask = p_mask[:, None].repeat(1, l)
+
+            masked_indices = torch.rand((b, l), device=input_embeds.device) < p_mask
+            # Add label condition filtering
+            valid_mask = (labels != -100) # Create valid encoding
+            masked_indices = masked_indices & valid_mask # Combine random encoding and valid encoding
+            # Magic number 126336 stands for the tokenizer special token,
+            # Magic embeddings, which is used for [MASK] token here,
+
+            padid = torch.tensor([[[pad_a], [pad_a], [pad_a], [pad_t]]],device=input_ids.device)
+
+            masked_embed, _ = self.get_emb(
+                input_ids=padid,
+                inference_mode=True
+            )
+
+            # print('masked_embed',masked_embed.shape)
+
+
+            noisy_embeds = torch.where(masked_indices.unsqueeze(-1), masked_embed, input_embeds)
+
+            # print('noisy_embeds',noisy_embeds.shape)
+
+
+            return noisy_embeds, p_mask, masked_embed
+
+        noisy_embeds, p_mask, masked_embed = forward_process_embeds(inputs_embeds, text_labels)
+
+        
+        masked_indices = self.get_masked_indices_from_embeds(noisy_embeds, masked_embed) # shape (b, l)
+        # print('masked_indices',masked_indices.shape)
+
+        prompt_index = (text_labels == -100).to(torch.int64) # shape (b, l)
+        
+        noisy_data_length = torch.sum((1-prompt_index), dim=-1, keepdim=True) # shape (b, 1)
+
+        # print('noisy_data_length',noisy_data_length.shape)
+        noisy_data_length = noisy_data_length.repeat(1, noisy_embeds.shape[1]) # shape (b, l)
+
+
+        model_outputs = self.llm(inputs_embeds=noisy_embeds, attention_mask=attention_mask, labels=text_labels)    # here we use the text token layer as the target label
 
         # parrallel generation
         # TODO: add tts adapter forward
         x_ori = model_outputs.logits
+
+        print('x_ori',x_ori.shape)
         text_vocab_size = self.model_config.vocab_config.padded_text_vocabsize
         audio_vocab_size = self.model_config.vocab_config.padded_audio_vocabsize
         xt = x_ori[..., :text_vocab_size]
@@ -262,7 +424,7 @@ class slam_model_s2s(slam_model):
                 xa.append(x_ori[..., text_vocab_size + audio_vocab_size * i : text_vocab_size + audio_vocab_size * (i + 1)])
 
         loss_recorder = []
-        total_loss, loss_recorder = self.compute_parallel_loss(xt, text_labels, xa, audio_labels)
+        total_loss, loss_recorder = self.compute_parallel_loss_1(xt, text_labels, xa, audio_labels,p_mask, masked_indices, noisy_data_length)
         model_outputs.loss = total_loss
 
         text_acc = -1
@@ -309,108 +471,56 @@ class slam_model_s2s(slam_model):
         return total_loss, layer_loss
 
 
-    @torch.no_grad()
-    def generate_non(self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            **kwargs,
-            ):
-        kwargs["inference_mode"] = True
-        inputs_embeds, attention_mask = self.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
-        )
-        gen_length = kwargs.get("max_new_tokens", 360)
-        # 直接调用
-        generated_ids = self.llm.generate_with_embeds(
-            inputs_embeds=inputs_embeds,
-            gen_length=gen_length,
-            **kwargs
-        )
-        return generated_ids
+    def compute_parallel_loss_1(
+        self, xt, text_labels, xa, audio_labels, 
+        p_mask, masked_indices, noisy_data_length
+    ):
+        """
+        Compute the parallel loss for text and audio layers with custom loss calculation.
+        """
+        text_vocab_size = self.model_config.vocab_config.padded_text_vocabsize
+        audio_vocab_size = self.model_config.vocab_config.padded_audio_vocabsize
+        layer_loss = [0 for _ in range(self.code_layer+1)]
+        # masked_indices = masked_indices.view(-1) 
+        
+        if text_labels is not None:
+            # xt: [B, T, V], text_labels: [B, T]
+            logits = xt
+            labels = text_labels
+            token_loss = F.cross_entropy(
+                logits[masked_indices],
+                labels[masked_indices],
+                ignore_index=-100,
+                reduction='none'
+            ) / p_mask[masked_indices]
+            text_loss = torch.sum(token_loss / noisy_data_length[masked_indices]) / text_labels.shape[0]
+            layer_loss[self.code_layer] = text_loss
+        else:
+            text_loss = 0
 
-    @torch.no_grad()
-    def generate_withx(self, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-                cfg_scale=0., remasking='low_confidence', mask_id=126336):
-        '''
-        Args:
-            prompt: A tensor of shape (1, l).
-            steps: Sampling steps, less than or equal to gen_length.
-            gen_length: Generated answer length.
-            block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-            temperature: Categorical distribution sampling temperature.
-            cfg_scale: Unsupervised classifier-free guidance scale.
-            remasking: Remasking strategy. 'low_confidence' or 'random'.
-            mask_id: The toke id of [MASK] is 126336.
-        '''
-        x = torch.full((1, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(prompt.device)
-        x[:, :prompt.shape[1]] = prompt.clone()
+        total_audio_loss = 0
+        for i in range(self.code_layer):
+            if audio_labels[:, i] is not None and self.train_config.task_type != "asr":
+                # xa[i]: [B, T, V], audio_labels[:,i]: [B, T]
+                logits_a = xa[i]
+                labels_a = audio_labels[:, i]
+                token_loss_a = F.cross_entropy(
+                    logits_a[masked_indices],
+                    labels_a[masked_indices],
+                    ignore_index=-100,
+                    reduction='none'
+                ) / p_mask[masked_indices]
+                audio_loss = torch.sum(token_loss_a / noisy_data_length[masked_indices]) / audio_labels.shape[0]
+                layer_loss[i] = audio_loss
+                total_audio_loss += audio_loss
 
-        prompt_index = (x != mask_id)
+        total_loss = (text_loss + total_audio_loss) / (self.code_layer + 1)
+        return total_loss, layer_loss
 
-        assert gen_length % block_length == 0
-        num_blocks = gen_length // block_length
 
-        assert steps % num_blocks == 0
-        steps = steps // num_blocks
 
-        for num_block in range(num_blocks):
-            block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length:] == mask_id)
-            num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps)
-            for i in range(steps):
-                mask_index = (x == mask_id)
-                if cfg_scale > 0.:
-                    un_x = x.clone()
-                    un_x[prompt_index] = mask_id
-                    x_ = torch.cat([x, un_x], dim=0)
-                    logits = self.model(x_).logits
-                    logits, un_logits = torch.chunk(logits, 2, dim=0)
-                    logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-                else:
-                    logits = self.model(x).logits
 
-                logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-
-                if remasking == 'low_confidence':
-                    p = F.softmax(logits.to(torch.float64), dim=-1)
-                    x0_p = torch.squeeze(
-                        torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
-                elif remasking == 'random':
-                    x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-                else:
-                    raise NotImplementedError(remasking)
-
-                x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
-
-                x0 = torch.where(mask_index, x0, x)
-                confidence = torch.where(mask_index, x0_p, -np.inf)
-
-                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                    transfer_index[j, select_index] = True
-                x[transfer_index] = x0[transfer_index]
-
-        return x
-
+    
     @staticmethod
     def add_gumbel_noise(logits, temperature):
         '''
@@ -431,128 +541,6 @@ class slam_model_s2s(slam_model):
 
 
     @torch.no_grad()
-    def generate_ar(self,
-                    input_ids: torch.LongTensor = None,
-                    attention_mask: Optional[torch.Tensor] = None,
-                    position_ids: Optional[torch.LongTensor] = None,
-                    past_key_values: Optional[List[torch.FloatTensor]] = None,
-                    inputs_embeds: Optional[torch.FloatTensor] = None,
-                    labels: Optional[torch.LongTensor] = None,
-                    use_cache: Optional[bool] = None,
-                    output_attentions: Optional[bool] = None,
-                    output_hidden_states: Optional[bool] = None,
-                    return_dict: Optional[bool] = None,
-                    **kwargs,
-                    ):
-        kwargs["inference_mode"] = True
-
-        inputs_embeds, attention_mask = self.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
-        )
-        
-        # print(inputs_embeds.shape)
-        pad_t = self.model_config.vocab_config.pad_t
-        pad_a = self.model_config.vocab_config.pad_a
-        eot = self.model_config.vocab_config.eot
-        eoa = self.model_config.vocab_config.eoa
-
-
-
-        max_new_tokens = kwargs.get("max_new_tokens", 360)
-
-        total_length = inputs_embeds.shape[1] + max_new_tokens 
-        padid = torch.tensor([[[pad_a], [pad_a], [pad_a], [pad_t]]])
-        masked_embed = self.model.embed_tokens(torch.tensor([padid]).to(inputs_embeds.device)) # shape (1, d)
-        x_embeds = masked_embed.repeat(1, total_length, 1).to(inputs_embeds.device) # shape (1, l + gen_length + suffix_len, d)
-        x_embeds[:, :inputs_embeds.shape[1]] = inputs_embeds.clone()
-
-
-        
-        num_iter = kwargs.get("nar_steps", 1)  # 非自回归迭代轮数
-        device = input_ids.device
-
-        text_vocab_size = self.model_config.vocab_config.padded_text_vocabsize
-        audio_vocab_size = self.model_config.vocab_config.padded_audio_vocabsize
-
-
-        # 非自回归 Mask-Predict 过程
-        for step in range(num_iter):
-            
-
-            # 模型前向
-            outputs = self.llm(
-                input_embedding=x_embeds,  # [1, seq, code_layer+1]
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-            logits = outputs.logits[0]  # [seq, vocab_sum]
-
-            # 拆分 text/audio logits
-            xt_logits = logits[..., :text_vocab_size]  # [seq, text_vocab]
-            xa_logits = []
-            for i in range(self.code_layer):
-                xa_logits.append(
-                    logits[..., text_vocab_size + audio_vocab_size * i : text_vocab_size + audio_vocab_size * (i + 1)]
-                )  # [seq, audio_vocab]
-
-            # 采样/贪心，mask位置才更新
-            # text
-            text_mask = (generated_ids[self.code_layer] == pad_t)
-            xt_probs = torch.softmax(xt_logits, dim=-1)
-            xt_sampled = torch.argmax(xt_probs, dim=-1)
-            generated_ids[self.code_layer][text_mask] = xt_sampled[text_mask]
-
-            # audio
-            for i in range(self.code_layer):
-                audio_mask = (generated_ids[i] == pad_a)
-                xa_probs = torch.softmax(xa_logits[i], dim=-1)
-                xa_sampled = torch.argmax(xa_probs, dim=-1)
-                generated_ids[i][audio_mask] = xa_sampled[audio_mask]
-
-            # if step < num_iter - 1:
-            #     # text置信度
-            #     text_conf = torch.max(xt_probs, dim=-1).values
-            #     gen_mask = (torch.arange(max_new_tokens, device=device) >= prompt_len)
-            #     mask_candidate = text_mask | gen_mask
-            #     ratio = 1.0 - (step + 1) / num_iter
-            #     num_mask = int(mask_candidate.sum().item() * ratio)
-            #     if num_mask > 0:
-            #         _, idx = torch.topk(text_conf * mask_candidate, k=num_mask, largest=False)
-            #         generated_ids[self.code_layer][idx] = pad_t
-            #     # audio置信度
-            #     for i in range(self.code_layer):
-            #         audio_conf = torch.max(torch.softmax(xa_logits[i], dim=-1), dim=-1).values
-            #         audio_mask_candidate = (generated_ids[i] == pad_a)
-            #         num_mask_audio = int(audio_mask_candidate.sum().item() * ratio)
-            #         if num_mask_audio > 0:
-            #             _, idx = torch.topk(audio_conf * audio_mask_candidate, k=num_mask_audio, largest=False)
-            #             generated_ids[i][idx] = pad_a
-
-        # 截断到 eot/eoa
-        text_tokens = generated_ids[self.code_layer]
-        eot_pos = (text_tokens == eot).nonzero(as_tuple=True)
-        if len(eot_pos[0]) > 0:
-            generated_ids[self.code_layer] = text_tokens[:eot_pos[0][0]]
-        for i in range(self.code_layer):
-            audio_tokens = generated_ids[i]
-            eoa_pos = (audio_tokens == eoa).nonzero(as_tuple=True)
-            if len(eoa_pos[0]) > 0:
-                generated_ids[i] = audio_tokens[:eoa_pos[0][0]]
-
-        return generated_ids
-
-
-    @torch.no_grad()
     def generate_non_autoregressive_parallel(self,
                                             input_ids: torch.LongTensor = None,
                                             attention_mask: Optional[torch.Tensor] = None,
@@ -566,7 +554,7 @@ class slam_model_s2s(slam_model):
                                             return_dict: Optional[bool] = None,
                                             **kwargs,
                                             ):
-        block_length = kwargs.get("block_length", 64)
+        block_length = kwargs.get("block_length", 60)
         steps = kwargs.get("steps", 1)
         max_new_tokens = kwargs.get("max_new_tokens", 360)
         temperature = kwargs.get("temperature", 1.0)
@@ -623,12 +611,18 @@ class slam_model_s2s(slam_model):
         else:
             embed_fn = self.llm.model.model.model.embed_tokens
 
+        do_layershift = kwargs.get("do_layershift", True)
+        if do_layershift:
+            layershift = layer_shift
+        else:
+            layershift = simple_shift
+
 
         padid = torch.tensor([[[pad_a], [pad_a], [pad_a], [pad_t]]],device=input_ids.device)
         print('aaaa',padid.shape)
 
 
-        masked_embed, _ = self.forward(
+        masked_embed, _ = self.get_emb(
             input_ids=padid,
             inference_mode=True
         )
@@ -675,7 +669,9 @@ class slam_model_s2s(slam_model):
 
                 # 拆分logits
                 xt_logits = logits[..., :text_vocab_size]
-                xa_logits = [logits[..., text_vocab_size + audio_vocab_size * i: text_vocab_size + audio_vocab_size * (i + 1)] for i in range(code_layer)]
+                xa_logits = self.group_decode_adapter(logits[..., text_vocab_size:])
+                print(xa_logits.shape)
+                xa_logits = [xa_logits[..., i * audio_vocab_size : (i + 1) * audio_vocab_size] for i in range(self.code_layer)]
 
                 # 文本层采样
                 text_logits_block = xt_logits[:, block_start:block_end, :]
@@ -690,6 +686,7 @@ class slam_model_s2s(slam_model):
 
                 # 音频层采样
                 for i in range(code_layer):
+
                     audio_logits_block = xa_logits[i][:, block_start:block_end, :]
                     if temperature > 0:
                         print('audio_logits_block',audio_logits_block.shape)
@@ -704,7 +701,34 @@ class slam_model_s2s(slam_model):
                 audio_tokens1 = torch.cat([layershift(audio_tokens[i], i).unsqueeze(1) for i in range(self.code_layer)], dim=1)
                 combined_input_ids = torch.cat([audio_tokens1, text_tokens.unsqueeze(1)], dim=1)
 
-                combined_input_emb, _ = self.forward(
+
+                print("input_ids shape:", combined_input_ids.shape)
+                print("input_ids max:", combined_input_ids.max().item())
+                print("input_ids min:", combined_input_ids.min().item())
+                print("vocab size:", self.llm.model.embed_tokens.num_embeddings)
+
+                # 对audio部分做clip
+                audio_ids = combined_input_ids[:, :code_layer, :]
+                audio_ids = torch.where(
+                    (audio_ids >= audio_vocab_size) | (audio_ids < 0),
+                    torch.full_like(audio_ids, pad_a),
+                    audio_ids
+                )
+
+                # 对text部分做clip
+                text_ids = combined_input_ids[:, code_layer:, :]  # 形状: [batch, 1, seq]
+                text_ids = torch.where(
+                    (text_ids >= text_vocab_size) | (text_ids < 0),
+                    torch.full_like(text_ids, pad_t),
+                    text_ids
+                )
+
+                # 合并回去
+                combined_input_ids = torch.cat([audio_ids, text_ids], dim=1)
+
+
+
+                combined_input_emb, _ = self.get_emb(
                                             input_ids=combined_input_ids,
                                             inference_mode=True
                                         )
@@ -824,18 +848,23 @@ class slam_model_s2s(slam_model):
                 past_key_values=past_key_values,
                 use_cache=True,
             )
+
             
             logits = outputs.logits[0]                      # batch size is 1
 
-            print(logits.shape)
+            print(logits.shape)  # 1, 156160
 
 
             past_key_values = outputs.past_key_values       # Update past_key_values for the next step
 
+
             # Split logits into text and audio layers based on vocab size
+            
             xt_logits = logits[..., :text_vocab_size]
             if self.group_decode_adapter is not None:
                 xa_logits = self.group_decode_adapter(logits[..., text_vocab_size:])
+                # 1, 12480
+                print('xa_logits',xa_logits.shape)
                 xa_logits = [xa_logits[..., i * audio_vocab_size : (i + 1) * audio_vocab_size] for i in range(self.code_layer)]
             else:
                 xa_logits = [logits[..., text_vocab_size + audio_vocab_size * i : text_vocab_size + audio_vocab_size * (i + 1)] for i in range(self.code_layer)]
